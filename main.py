@@ -1,64 +1,101 @@
 #!/usr/bin/env python3
-"""news-image-20261122 entry program (standard library only).
+"""news-image-20261122 entrypoint (standard library only).
 
-Copies the pre-rendered front page ``entry.png`` (1024x1024, Sunday
-22 November 2026) to ``/output/entry.png`` (or ``$MAKEFUN_OUTPUT_DIR``).
-The image itself is drawn at build time by experiments/draw_round1.py;
-this program only validates the PNG and reproduces it byte-for-byte,
-so the grading sandbox needs nothing beyond the standard library.
+The front page itself (``entry.png``, 1024x1024, Sunday 22 November 2026)
+was rendered at build time with the agent's image tool and is stored in
+this repository. This program does no drawing and needs no third-party
+package: it checks the stored PNG is whole and within the competition
+limits, then reproduces it byte-for-byte at ``/output/entry.png``
+(or ``$MAKEFUN_OUTPUT_DIR``), and verifies the copy matches.
+
+Exit codes: 0 ok, 2 bad input, 3 copy mismatch.
 """
+
 import hashlib
 import os
 import struct
 import sys
+import zlib
 
-MAX_BYTES = 1048576
-EXPECT_W, EXPECT_H = 1024, 1024
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+LIMIT_BYTES = 1048576
+WANT_WIDTH = 1024
+WANT_HEIGHT = 1024
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 
-def fail(msg, code):
-    print(f"error: {msg}", file=sys.stderr)
+def die(message, code):
+    print("error: " + message, file=sys.stderr)
     return code
 
 
-def check_png(data):
-    if len(data) > MAX_BYTES:
-        return f"entry.png is {len(data)} bytes, over the {MAX_BYTES} limit"
-    if len(data) < 8 or data[:8] != PNG_MAGIC:
-        return "entry.png is not a PNG file"
-    if len(data) < 33 or data[12:16] != b"IHDR":
+def validate_png(blob):
+    """Return an error string, or None when the blob is a whole 1024x1024 PNG."""
+    if len(blob) > LIMIT_BYTES:
+        return "entry.png is %d bytes, over the %d limit" % (len(blob), LIMIT_BYTES)
+    if len(blob) < 8 or blob[:8] != PNG_SIGNATURE:
+        return "entry.png does not start with the PNG signature"
+    if len(blob) < 33 or blob[12:16] != b"IHDR":
         return "entry.png has no IHDR chunk"
-    width, height = struct.unpack(">II", data[16:24])
-    if (width, height) != (EXPECT_W, EXPECT_H):
-        return f"entry.png is {width}x{height}, expected 1024x1024"
-    if data[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82":
+    width, height = struct.unpack(">II", blob[16:24])
+    if width != WANT_WIDTH or height != WANT_HEIGHT:
+        return "entry.png is %dx%d, expected 1024x1024" % (width, height)
+    if blob[-12:] != IEND_TRAILER:
         return "entry.png has no IEND trailer"
+    return check_chunks(blob)
+
+
+def check_chunks(blob):
+    """Walk the PNG chunks, verifying lengths, CRCs, and that an IDAT exists."""
+    offset = 8
+    seen_idat = False
+    seen_iend = False
+    while offset + 8 <= len(blob):
+        length, ctype = struct.unpack(">I4s", blob[offset:offset + 8])
+        end = offset + 12 + length
+        if end > len(blob):
+            return "entry.png has a truncated %s chunk" % ctype.decode("latin1")
+        stored_crc = struct.unpack(">I", blob[end - 4:end])[0]
+        actual_crc = zlib.crc32(blob[offset + 4:end - 4]) & 0xFFFFFFFF
+        if stored_crc != actual_crc:
+            return "entry.png has a bad CRC in the %s chunk" % ctype.decode("latin1")
+        if ctype == b"IDAT":
+            seen_idat = True
+        if ctype == b"IEND":
+            seen_iend = True
+            if end != len(blob):
+                return "entry.png has bytes after the IEND chunk"
+            break
+        offset = end
+    if not seen_idat:
+        return "entry.png has no IDAT chunk"
+    if not seen_iend:
+        return "entry.png has no IEND chunk"
     return None
 
 
 def main(argv):
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, "entry.png")
+    base = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(base, "entry.png")
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    dst = os.path.join(out_dir, "entry.png")
+    target = os.path.join(out_dir, "entry.png")
     try:
-        with open(src, "rb") as fh:
-            data = fh.read()
+        with open(source, "rb") as handle:
+            blob = handle.read()
     except OSError as exc:
-        return fail(f"cannot read entry.png: {exc}", 2)
-    problem = check_png(data)
+        return die("cannot read entry.png: %s" % exc, 2)
+    problem = validate_png(blob)
     if problem:
-        return fail(problem, 2)
+        return die(problem, 2)
     os.makedirs(out_dir, exist_ok=True)
-    with open(dst, "wb") as fh:
-        fh.write(data)
-    with open(dst, "rb") as fh:
-        back = fh.read()
-    if back != data:
-        return fail("written entry.png does not match the source bytes", 3)
-    digest = hashlib.sha256(data).hexdigest()
-    print(f"wrote {dst} ({len(data)} bytes, sha256 {digest})")
+    with open(target, "wb") as handle:
+        handle.write(blob)
+    with open(target, "rb") as handle:
+        written = handle.read()
+    if written != blob:
+        return die("written entry.png differs from the stored bytes", 3)
+    print("wrote %s (%d bytes, sha256 %s)"
+          % (target, len(blob), hashlib.sha256(blob).hexdigest()))
     return 0
 
 
